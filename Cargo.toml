@@ -3,7 +3,7 @@ members = [".", "fuser-tests"]
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.86"
 authors = ["Christopher Berner <me@cberner.com>"]
 license = "MIT"
 repository = "https://github.com/cberner/fuser"
