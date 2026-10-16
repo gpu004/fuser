@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::ffi::CString;
