@@ -6,18 +6,24 @@ build: pre
 	cargo build --examples --features=experimental
 
 format:
-	cargo +nightly fmt --all
+	cargo fmt --all
 
 pre:
-	cargo +nightly fmt --all -- --check
+	cargo fmt --all -- --check
 	cargo deny check licenses
 	cargo clippy --all-targets
 	cargo clippy --all-targets --no-default-features
+	cargo clippy --all-targets --all-features
 
 xfstests:
 	docker build -t fuser:xfstests -f xfstests.Dockerfile .
 	# Additional permissions are needed to be able to mount FUSE
-	docker run --rm -$(INTERACTIVE)t --cap-add SYS_ADMIN --cap-add IPC_OWNER --device /dev/fuse --security-opt apparmor:unconfined \
+	# LINUX_IMMUTABLE is for chattr +i/+a, and SYS_PACCT for BSD process accounting. Neither
+	# is in Docker's default set, and without them those tests fail rather than skip.
+	# The seccomp profile is left on: turning it off would let the io_uring tests run, but it
+	# also unblocks swapon, and swap is a global resource rather than a per-container one
+	docker run --rm -$(INTERACTIVE)t --cap-add SYS_ADMIN --cap-add IPC_OWNER --cap-add SYS_PACCT \
+	 --cap-add LINUX_IMMUTABLE --device /dev/fuse --security-opt apparmor:unconfined \
 	 --memory=2g --kernel-memory=200m \
 	 -v "$(shell pwd)/logs:/code/logs" fuser:xfstests bash -c "cd /code/fuser && ./xfstests.sh"
 
@@ -63,8 +69,9 @@ mount_tests:
 	 fuser:mount_tests_libfuse3 bash -c "cd /code/fuser && cargo run -p fuser-tests -- linux-mount-libfuse3"
 
 test_passthrough:
-	cargo build --example passthrough
+	cargo build --example passthrough --example passthrough_fork
 	sudo tests/test_passthrough.sh target/debug/examples/passthrough
+	sudo tests/test_passthrough.sh target/debug/examples/passthrough_fork
 
 test: pre mount_tests pjdfs_tests xfstests
 	cargo test

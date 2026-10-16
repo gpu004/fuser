@@ -15,6 +15,14 @@ FUSE-Rust does not just provide bindings, it is a rewrite of the original FUSE C
 This library was originally forked from the [`fuse` crate](https://github.com/zargony/fuse-rs) with the intention
 of continuing development. In particular adding features from ABIs after 7.19
 
+## Use of AI
+
+Version 0.18.0 is the last version that was primarily developed without coding agents.
+
+Future releases will be developed primarily by a coding agent, as I believe this will lead to higher quality code,
+and faster feature development.
+All the changes will receive at least a cursory review from a human, and a full review from a coding agent.
+
 ## Documentation
 
 [FUSE-Rust reference][Documentation]
@@ -121,7 +129,9 @@ Licensed under [MIT License](LICENSE.md), except for those files in `examples/` 
 
 ## Contribution
 
-Fork, hack, submit pull request. Make sure to make it useful for the target audience, keep the project's philosophy and Rust coding standards in mind. For larger or essential changes, you may want to open an issue for discussion first. Also remember to update the [Changelog] if your changes are relevant to the users.
+**Pull requests are no longer being accepted. Please file an issue, or fork the project instead.**
+
+Fork, hack, ~~submit pull request~~. Make sure to make it useful for the target audience, keep the project's philosophy and Rust coding standards in mind. For larger or essential changes, you may want to open an issue for discussion first. Also remember to update the [Changelog] if your changes are relevant to the users.
 
 [Rust]: https://rust-lang.org
 [Homebrew]: https://brew.sh

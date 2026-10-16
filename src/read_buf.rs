@@ -5,7 +5,7 @@ use crate::session::MAX_WRITE_SIZE;
 
 /// Size of the buffer for reading a request from the kernel. Since the kernel may send
 /// up to `MAX_WRITE_SIZE` bytes in a write request, we use that value plus some extra space.
-const BUFFER_SIZE: usize = MAX_WRITE_SIZE + 4096;
+pub(crate) const BUFFER_SIZE: usize = MAX_WRITE_SIZE + 4096;
 
 /// A buffer that provides an aligned sub-slice for FUSE operations.
 ///

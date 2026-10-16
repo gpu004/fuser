@@ -21,6 +21,7 @@ use crate::Errno;
 use crate::FileAttr;
 use crate::FileType;
 use crate::PollEvents;
+use crate::StatxAttr;
 use crate::channel::ChannelSender;
 use crate::ll::Generation;
 use crate::ll::INodeNo;
@@ -63,6 +64,17 @@ impl ReplySender {
     pub(crate) fn open_backing(&self, fd: BorrowedFd<'_>) -> std::io::Result<BackingId> {
         match self {
             ReplySender::Channel(sender) => sender.open_backing(fd),
+            #[cfg(test)]
+            ReplySender::Assert(_) => unreachable!(),
+            #[cfg(test)]
+            ReplySender::Sync(_) => unreachable!(),
+        }
+    }
+
+    /// Wraps a raw backing file ID
+    pub(crate) unsafe fn wrap_backing(&self, id: u32) -> BackingId {
+        match self {
+            ReplySender::Channel(sender) => unsafe { sender.wrap_backing(id) },
             #[cfg(test)]
             ReplySender::Assert(_) => unreachable!(),
             #[cfg(test)]
@@ -232,6 +244,33 @@ impl ReplyEntry {
         ));
     }
 
+    /// Reply to a request with the given entry.
+    ///
+    /// Use this function instead of `ReplyEntry::entry` if the
+    /// entry TTL needs to be different from the attribute TTL.
+    ///
+    /// * `attr_ttl` - Time-to-live for the file attributes. Controls how long the
+    ///   kernel will cache inode metadata (e.g., size, permissions, timestamps)
+    ///   before issuing a new `GETATTR` request.
+    /// * `entry_ttl` - Time-to-live for the directory entry (name-to-inode mapping).
+    ///   Controls how long the kernel will cache the existence of this
+    ///   path without issuing a new `LOOKUP` request.
+    pub fn entry_with_ttls(
+        self,
+        attr_ttl: &Duration,
+        entry_ttl: &Duration,
+        attr: &FileAttr,
+        generation: Generation,
+    ) {
+        self.reply.send_ll(&ll::ResponseStruct::new_entry(
+            attr.ino,
+            generation,
+            &attr.into(),
+            *attr_ttl,
+            *entry_ttl,
+        ));
+    }
+
     /// Reply to a request with the given error code
     pub fn error(self, err: Errno) {
         self.reply.error(err);
@@ -259,6 +298,35 @@ impl ReplyAttr {
     pub fn attr(self, ttl: &Duration, attr: &FileAttr) {
         self.reply
             .send_ll(&ll::ResponseStruct::new_attr(ttl, &attr.into()));
+    }
+
+    /// Reply to a request with the given error code
+    pub fn error(self, err: Errno) {
+        self.reply.error(err);
+    }
+}
+
+///
+/// Statx Reply
+///
+#[derive(Debug)]
+pub struct ReplyStatx {
+    reply: ReplyRaw,
+}
+
+impl Reply for ReplyStatx {
+    fn new(unique: ll::RequestId, sender: ReplySender) -> ReplyStatx {
+        ReplyStatx {
+            reply: Reply::new(unique, sender),
+        }
+    }
+}
+
+impl ReplyStatx {
+    /// Reply to a request with the given attributes
+    pub fn statx(self, ttl: &Duration, attr: &StatxAttr) {
+        self.reply
+            .send_ll(&ll::ResponseStruct::new_statx(ttl, attr));
     }
 
     /// Reply to a request with the given error code
@@ -328,15 +396,34 @@ impl ReplyOpen {
 
     /// Registers a fd for passthrough, returning a `BackingId`.  Once you have the backing ID,
     /// you can pass it as the 3rd parameter of [`ReplyOpen::opened_passthrough()`]. This is done in
-    /// two separate steps because it may make sense to reuse backing IDs (to avoid having to
-    /// repeatedly reopen the underlying file or potentially keep thousands of fds open).
+    /// two separate steps because you must reuse backing IDs for the same inode for all open file handles.
     pub fn open_backing(&self, fd: impl std::os::fd::AsFd) -> std::io::Result<BackingId> {
         // TODO: assert passthrough capability is enabled.
         self.reply.sender.as_ref().unwrap().open_backing(fd.as_fd())
     }
 
+    /// Wraps a raw FUSE `backing_id` value, returning a `BackingId`. Once you have the backing ID,
+    /// you can pass it as the 3rd parameter of [`ReplyOpen::opened_passthrough()`]. This is done in
+    /// two separate steps because you must reuse backing IDs for the same inode for all open file handles.
+    ///
+    /// This function takes ownership of the given backing ID value, automatically closing it once
+    /// the returned `BackingId` is dropped. You may reobtain ownership of the backing ID by calling
+    /// [`BackingId::into_raw()`].
+    ///
+    /// # Safety
+    ///
+    /// The given ID must be open and belong to this FUSE session, and may not be closed while the
+    /// returned `BackingId` instance is still live.
+    pub unsafe fn wrap_backing(&self, id: u32) -> BackingId {
+        // TODO: assert passthrough capability is enabled.
+        unsafe { self.reply.sender.as_ref().unwrap().wrap_backing(id) }
+    }
+
     /// Reply to a request with an opened backing id. Call [`ReplyOpen::open_backing()`]
     /// to get one of these.
+    ///
+    /// Note that you must reuse the given `BackingId` for all future [`ReplyOpen::opened_passthrough()`]
+    /// invocations as long as the passed file handle stays open!
     pub fn opened_passthrough(self, fh: ll::FileHandle, flags: FopenFlags, backing_id: &BackingId) {
         // TODO: assert passthrough capability is enabled.
         let flags = flags | FopenFlags::FOPEN_PASSTHROUGH;
@@ -468,14 +555,33 @@ impl ReplyCreate {
 
     /// Registers a fd for passthrough, returning a `BackingId`.  Once you have the backing ID,
     /// you can pass it as the 6th parameter of `ReplyCreate::created_passthrough()`.  This is done in
-    /// two separate steps because it may make sense to reuse backing IDs (to avoid having to
-    /// repeatedly reopen the underlying file or potentially keep thousands of fds open).
+    /// two separate steps because you must reuse backing IDs for the same inode for all open file handles.
     pub fn open_backing(&self, fd: impl std::os::fd::AsFd) -> std::io::Result<BackingId> {
         self.reply.sender.as_ref().unwrap().open_backing(fd.as_fd())
     }
 
-    /// Reply to a request with an opened backing id. Call `ReplyCreate::open_backing()` to get one of
+    /// Wraps a raw FUSE `backing_id` value, returning a `BackingId`. Once you have the backing ID,
+    /// you can pass it as the 3rd parameter of [`ReplyCreate::created_passthrough()`]. This is done in
+    /// two separate steps because you must reuse backing IDs for the same inode for all open file handles.
+    ///
+    /// This function takes ownership of the given backing ID value, automatically closing it once
+    /// the returned `BackingId` is dropped. You may reobtain ownership of the backing ID by calling
+    /// [`BackingId::into_raw()`].
+    ///
+    /// # Safety
+    ///
+    /// The given ID must be open and belong to this FUSE session, and may not be closed while the
+    /// returned `BackingId` instance is still live.
+    pub unsafe fn wrap_backing(&self, id: u32) -> BackingId {
+        // TODO: assert passthrough capability is enabled.
+        unsafe { self.reply.sender.as_ref().unwrap().wrap_backing(id) }
+    }
+
+    /// Reply to a request with an opened backing id. Call [`ReplyCreate::open_backing()`] to get one of
     /// these.
+    ///
+    /// Note that you must reuse the given `BackingId` for all future [`ReplyOpen::opened_passthrough()`]
+    /// invocations as long as the passed file handle stays open!
     pub fn created_passthrough(
         self,
         ttl: &Duration,
@@ -631,6 +737,17 @@ impl ReplyDirectory {
         }
     }
 
+    /// Bytes still available for entries in this reply.
+    ///
+    /// Before any entry is added this is the buffer size the kernel asked for, which lets
+    /// a filesystem size a batch of work up front rather than discovering the limit only
+    /// when [`add()`](Self::add) reports the buffer full. Each entry costs its name plus a
+    /// fixed header, padded for alignment, so this is a budget rather than an entry count;
+    /// `add()` remains the authority on whether a particular entry fits.
+    pub fn remaining_capacity(&self) -> usize {
+        self.data.remaining_capacity()
+    }
+
     /// Add an entry to the directory reply buffer. Returns true if the buffer is full.
     /// A transparent offset value can be provided for each entry. The kernel uses these
     /// value to request the next entries in further readdir calls
@@ -679,6 +796,18 @@ impl ReplyDirectoryPlus {
             reply: Reply::new(unique, sender),
             buf: DirEntPlusList::new(size),
         }
+    }
+
+    /// Bytes still available for entries in this reply.
+    ///
+    /// Before any entry is added this is the buffer size the kernel asked for. It matters
+    /// more here than for plain readdir: each entry carries a full set of attributes, so a
+    /// filesystem that must fetch them can size that work to the budget instead of
+    /// preparing an entry only to find it does not fit. Each entry costs its name plus a
+    /// fixed header, padded for alignment, so this is a budget rather than an entry count;
+    /// [`add()`](Self::add) remains the authority on whether a particular entry fits.
+    pub fn remaining_capacity(&self) -> usize {
+        self.buf.remaining_capacity()
     }
 
     /// Add an entry to the directory reply buffer. Returns true if the buffer is full.
@@ -1155,6 +1284,83 @@ mod test {
         let mut reply = ReplyDirectory::new(ll::RequestId(0xdeadbeef), sender, 4096);
         assert!(!reply.add(INodeNo(0xaabb), 1, FileType::Directory, "hello"));
         assert!(!reply.add(INodeNo(0xccdd), 2, FileType::RegularFile, "world.rs"));
+        reply.ok();
+    }
+
+    #[test]
+    fn reply_directory_remaining_capacity() {
+        let (tx, _rx) = sync_channel::<()>(1);
+        let mut reply = ReplyDirectory::new(ll::RequestId(0xdeadbeef), ReplySender::Sync(tx), 4096);
+        // Starts out as the size the kernel asked for
+        assert_eq!(reply.remaining_capacity(), 4096);
+
+        assert!(!reply.add(INodeNo(1), 1, FileType::Directory, "hello"));
+        let after_first = reply.remaining_capacity();
+        assert!(after_first < 4096);
+
+        assert!(!reply.add(INodeNo(2), 2, FileType::RegularFile, "world.rs"));
+        assert!(reply.remaining_capacity() < after_first);
+        reply.ok();
+    }
+
+    /// The budget must agree with `add()`: entries keep fitting while capacity remains,
+    /// and the entry that is finally refused needed more room than was left.
+    #[test]
+    fn reply_directory_capacity_agrees_with_add() {
+        let (tx, _rx) = sync_channel::<()>(1);
+        let mut reply = ReplyDirectory::new(ll::RequestId(0xdeadbeef), ReplySender::Sync(tx), 256);
+        let mut added = 0;
+        let mut before_full = reply.remaining_capacity();
+        for i in 0..100u64 {
+            before_full = reply.remaining_capacity();
+            if reply.add(INodeNo(i + 1), i + 1, FileType::RegularFile, "some-name") {
+                break;
+            }
+            added += 1;
+            assert!(reply.remaining_capacity() < before_full);
+        }
+        // The buffer filled before the entries ran out, and the refused entry did not fit
+        // in what remained
+        assert!(added > 0 && added < 100);
+        assert!(before_full < 256);
+        reply.ok();
+    }
+
+    #[test]
+    fn reply_directory_plus_remaining_capacity() {
+        let (tx, _rx) = sync_channel::<()>(1);
+        let mut reply =
+            ReplyDirectoryPlus::new(ll::RequestId(0xdeadbeef), ReplySender::Sync(tx), 4096);
+        assert_eq!(reply.remaining_capacity(), 4096);
+
+        let attr = FileAttr {
+            ino: INodeNo(1),
+            size: 0,
+            blocks: 0,
+            atime: UNIX_EPOCH,
+            mtime: UNIX_EPOCH,
+            ctime: UNIX_EPOCH,
+            crtime: UNIX_EPOCH,
+            kind: FileType::RegularFile,
+            perm: 0o644,
+            nlink: 1,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            flags: 0,
+            blksize: 512,
+        };
+        assert!(!reply.add(
+            INodeNo(1),
+            1,
+            "hello",
+            &Duration::ZERO,
+            &attr,
+            ll::Generation(0)
+        ));
+        // An entry here carries a full set of attributes, so it costs far more than a
+        // plain readdir entry
+        assert!(reply.remaining_capacity() < 4096 - 100);
         reply.ok();
     }
 

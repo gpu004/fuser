@@ -22,6 +22,7 @@ use fuse2_sys::fuse_args;
 use log::info;
 use log::warn;
 use mount_options::MountOption;
+use mount_options::check_option_values;
 
 use crate::dev_fuse::DevFuse;
 
@@ -35,13 +36,14 @@ fn with_fuse_args<T, F: FnOnce(&fuse_args) -> T>(
 ) -> T {
     use std::ffi::CString;
 
-    use mount_options::option_to_string;
+    use mount_options::option_to_escaped_string;
 
     let mut args = vec![CString::new("rust-fuse").unwrap()];
     for x in options {
         args.extend_from_slice(&[
             CString::new("-o").unwrap(),
-            CString::new(option_to_string(x)).unwrap(),
+            CString::new(option_to_escaped_string(x))
+                .expect("option values are checked for NUL by check_option_values()"),
         ]);
     }
     if let Some(acl) = acl.to_mount_option() {
@@ -53,6 +55,43 @@ fn with_fuse_args<T, F: FnOnce(&fuse_args) -> T>(
         argc: argptrs.len() as i32,
         argv: argptrs.as_ptr(),
         allocated: 0,
+    })
+}
+
+/// Name what could not be reached, so that a bare "No such file or directory" does not
+/// leave the caller guessing between the mountpoint, the FUSE device and the mount
+/// helper. The error kind is preserved for callers that match on it; the OS error
+/// number survives only in the message
+#[allow(dead_code)] // Not used with every feature.
+pub(crate) fn context(what: impl std::fmt::Display, err: io::Error) -> io::Error {
+    io::Error::new(err.kind(), format!("{what}: {err}"))
+}
+
+/// Make a libfuse call that signals failure through its return value, and turn a failure
+/// into an error worth reporting.
+///
+/// libfuse does not set errno to report these failures, and does not clear it beforehand,
+/// so reading `io::Error::last_os_error()` afterwards picks up whatever an unrelated call
+/// left behind: an unrelated error, or errno 0, which renders as the nonsensical
+/// "Success (os error 0)". Clearing errno first makes what remains attributable - anything
+/// non-zero was set during the call, and is worth passing on. When nothing was set, the
+/// only thing to report is which call failed; libfuse writes its own diagnostic to stderr.
+#[cfg(any(test, fuser_mount_impl = "libfuse2", fuser_mount_impl = "libfuse3"))]
+fn libfuse_call<T>(
+    function: &str,
+    call: impl FnOnce() -> T,
+    succeeded: impl FnOnce(&T) -> bool,
+) -> io::Result<T> {
+    nix::errno::Errno::clear();
+    let result = call();
+    if succeeded(&result) {
+        return Ok(result);
+    }
+    Err(match io::Error::last_os_error() {
+        err if err.raw_os_error() == Some(0) => {
+            io::Error::other(format!("libfuse's {function}() failed"))
+        }
+        err => err,
     })
 }
 
@@ -93,6 +132,9 @@ impl MountImpl {
 pub(crate) struct Mount {
     mount_impl: Option<MountImpl>,
     mount_point: PathBuf,
+    /// The FUSE device fd of this mount's kernel connection.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    fuse_device: Arc<DevFuse>,
 }
 
 impl Mount {
@@ -101,39 +143,25 @@ impl Mount {
         options: &[MountOption],
         acl: SessionACL,
     ) -> io::Result<(Arc<DevFuse>, Mount)> {
+        // Checked here, rather than in Session, so that every formatting of an option
+        // value below can rely on it
+        check_option_values(options)?;
+
         #[cfg(fuser_mount_impl = "pure-rust")]
-        {
+        let (dev_fuse, mount_impl) = {
             let (dev_fuse, mount) = fuse_pure::MountImpl::new(mountpoint, options, acl)?;
-            Ok((
-                dev_fuse,
-                Mount {
-                    mount_impl: Some(MountImpl::Pure(mount)),
-                    mount_point: mountpoint.to_path_buf(),
-                },
-            ))
-        }
+            (dev_fuse, MountImpl::Pure(mount))
+        };
         #[cfg(fuser_mount_impl = "libfuse2")]
-        {
+        let (dev_fuse, mount_impl) = {
             let (dev_fuse, mount) = fuse2::MountImpl::new(mountpoint, options, acl)?;
-            Ok((
-                dev_fuse,
-                Mount {
-                    mount_impl: Some(MountImpl::Fuse2(mount)),
-                    mount_point: mountpoint.to_path_buf(),
-                },
-            ))
-        }
+            (dev_fuse, MountImpl::Fuse2(mount))
+        };
         #[cfg(fuser_mount_impl = "libfuse3")]
-        {
+        let (dev_fuse, mount_impl) = {
             let (dev_fuse, mount) = fuse3::MountImpl::new(mountpoint, options, acl)?;
-            Ok((
-                dev_fuse,
-                Mount {
-                    mount_impl: Some(MountImpl::Fuse3(mount)),
-                    mount_point: mountpoint.to_path_buf(),
-                },
-            ))
-        }
+            (dev_fuse, MountImpl::Fuse3(mount))
+        };
         #[cfg(fuser_mount_impl = "macos-no-mount")]
         {
             let _ = (mountpoint, options, acl);
@@ -141,11 +169,45 @@ impl Mount {
                 "Mount is not enabled; this is test-only configuration",
             ))
         }
+        #[cfg(not(fuser_mount_impl = "macos-no-mount"))]
+        {
+            Ok((
+                dev_fuse.clone(),
+                Mount {
+                    mount_impl: Some(mount_impl),
+                    mount_point: mountpoint.to_path_buf(),
+                    fuse_device: dev_fuse,
+                },
+            ))
+        }
+    }
+
+    /// Whether teardown should unmount the mountpoint: only if our kernel connection
+    /// is still alive. If it is dead (POLLERR on the FUSE device fd), the filesystem
+    /// was either unmounted externally (issue #658) or the connection was aborted,
+    /// and unmounting by path could hit an unrelated filesystem mounted there in the
+    /// meantime. This is the same check libfuse's fuse_kern_unmount() performs, with
+    /// the same limits: an aborted connection whose dead mount is still in the mount
+    /// table is left behind (auto_unmount or "fusermount -u -z" cleans it up), and a
+    /// lazily detached mount keeps the connection alive, so it is still unmounted by
+    /// path. The decision never accesses the mountpoint through the filesystem,
+    /// which could block on an unresponsive or unserved mount.
+    #[cfg(not(target_os = "macos"))]
+    fn should_unmount(&self) -> bool {
+        is_mounted(&self.fuse_device)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn should_unmount(&self) -> bool {
+        true
     }
 
     pub(crate) fn umount(mut self) -> io::Result<()> {
         match self.mount_impl.take() {
             Some(mut mount) => {
+                if !self.should_unmount() {
+                    return Ok(());
+                }
                 info!("Unmounting {}", self.mount_point.display());
                 mount.umount_impl()
             }
@@ -157,6 +219,9 @@ impl Mount {
 impl Drop for Mount {
     fn drop(&mut self) {
         if let Some(mut mount) = self.mount_impl.take() {
+            if !self.should_unmount() {
+                return;
+            }
             if let Err(err) = mount.umount_impl() {
                 // This is not necessarily an error: may happen if a user called 'umount'.
                 warn!("Unmount failed: {}", err);
@@ -186,13 +251,89 @@ fn libc_umount(mnt: &CStr) -> nix::Result<()> {
         target_os = "netbsd"
     )))]
     {
-        nix::mount::umount(mnt)
+        // Detach lazily, as libfuse's fuse_kern_unmount() does. An eager unmount fails
+        // with EBUSY while the filesystem is still in use, and by then the Mount has
+        // been consumed, so the caller has nothing left to retry with and the mount is
+        // left behind. The unprivileged path has always been lazy, going through
+        // "fusermount -u -z", so this also makes privileged teardown agree with it
+        nix::mount::umount2(mnt, nix::mount::MntFlags::MNT_DETACH)
     }
+}
+
+/// Waits (bounded) for the FUSE kernel connection to end after an unmount was
+/// requested. Returns false if the connection is still alive when the timeout
+/// expires, e.g. because a lazily unmounted filesystem is still in use, or an
+/// unmount helper failed in a way that cannot be observed directly.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn connection_ended(fuse_device: &DevFuse, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while is_mounted(fuse_device) {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    true
+}
+
+/// The FUSE device poll semantics are untested on macOS, so assume the unmount
+/// took effect there.
+#[cfg(target_os = "macos")]
+pub(crate) fn connection_ended(_fuse_device: &DevFuse, _timeout: std::time::Duration) -> bool {
+    true
+}
+
+/// Lazily unmount via the given fusermount binary. Helper failures are reported,
+/// so that callers do not mistake a still-mounted filesystem for an unmounted
+/// one - BackgroundSession would otherwise wait forever for the session to end.
+#[cfg(any(
+    all(test, target_os = "linux"),
+    fuser_mount_impl = "pure-rust",
+    all(
+        fuser_mount_impl = "libfuse2",
+        not(any(
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "openbsd",
+            target_os = "netbsd"
+        ))
+    )
+))]
+pub(crate) fn fusermount_unmount(fusermount_bin: &str, mountpoint: &CStr) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    use log::debug;
+
+    let mut builder = std::process::Command::new(fusermount_bin);
+    builder
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    builder
+        .arg("-u")
+        .arg("-q")
+        .arg("-z")
+        .arg("--")
+        .arg(std::ffi::OsStr::from_bytes(mountpoint.to_bytes()));
+
+    let output = builder
+        .output()
+        .map_err(|err| context(format_args!("running {fusermount_bin}"), err))?;
+    debug!("fusermount: {}", String::from_utf8_lossy(&output.stdout));
+    debug!("fusermount: {}", String::from_utf8_lossy(&output.stderr));
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "fusermount failed to unmount ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(())
 }
 
 /// Warning: This will return true if the filesystem has been detached (lazy unmounted), but not
 /// yet destroyed by the kernel.
-#[cfg(any(all(not(target_os = "macos"), test), fuser_mount_impl = "pure-rust"))]
+#[cfg(not(target_os = "macos"))]
 fn is_mounted(fuse_device: &DevFuse) -> bool {
     use std::os::unix::io::AsFd;
     use std::slice;
@@ -207,7 +348,9 @@ fn is_mounted(fuse_device: &DevFuse) -> bool {
         let res = poll(slice::from_mut(&mut poll_fd), PollTimeout::ZERO);
         break match res {
             Ok(0) => true,
-            Ok(1) => poll_fd
+            // The kernel reports POLLERR on /dev/fuse if and only if the connection
+            // is no longer alive, i.e. the filesystem has been unmounted or aborted
+            Ok(1) => !poll_fd
                 .revents()
                 .is_some_and(|r| r.contains(PollFlags::POLLERR)),
             Ok(_) => unreachable!(),
@@ -252,6 +395,145 @@ mod test {
         );
     }
 
+    /// A fusermount helper that cannot run or exits nonzero must report an error:
+    /// the filesystem is then still mounted, and treating that as success would
+    /// make teardown wait forever for a session that never ends.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn fusermount_unmount_reports_failure() {
+        use std::ffi::CString;
+
+        let mountpoint = CString::new("/nonexistent").unwrap();
+        // Helper exits nonzero (/bin/false ignores its arguments)
+        assert!(fusermount_unmount("/bin/false", &mountpoint).is_err());
+        // Helper cannot be executed at all, which must say which helper that was
+        let err = fusermount_unmount("/nonexistent/fusermount", &mountpoint).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(err.to_string().contains("/nonexistent/fusermount"), "{err}");
+        // Helper reports success
+        assert!(fusermount_unmount("/bin/true", &mountpoint).is_ok());
+    }
+
+    /// A mount touches the mountpoint, the FUSE device and the mount helper, so "No such
+    /// file or directory" on its own does not say which one is missing (issue #250)
+    #[test]
+    fn context_names_what_failed() {
+        let err = context("/dev/fuse", io::ErrorKind::PermissionDenied.into());
+        // Preserved, so that callers matching on the kind keep working
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("/dev/fuse"), "{err}");
+        assert!(err.to_string().contains("permission denied"), "{err}");
+    }
+
+    /// The mountpoint is the first thing a mount resolves, and a missing one is what the
+    /// reporter of issue #250 mistook a missing /dev/fuse for
+    #[test]
+    #[cfg(fuser_mount_impl = "pure-rust")]
+    fn missing_mountpoint_is_named() {
+        let err =
+            Mount::new(Path::new("/nonexistent/mountpoint"), &[], SessionACL::Owner).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(err.to_string().contains("/nonexistent/mountpoint"), "{err}");
+    }
+
+    /// A libfuse call that fails without setting errno must not be reported with whatever
+    /// errno an unrelated call left behind - least of all errno 0, which renders as the
+    /// nonsensical "Success (os error 0)"
+    #[test]
+    fn libfuse_call_reports_only_its_own_errno() {
+        // Stale errno from an unrelated call, which the failing call below does not set
+        nix::errno::Errno::ENOTTY.set();
+        let err = libfuse_call("fuse_session_new", || (), |_| false).unwrap_err();
+        assert_eq!(err.raw_os_error(), None);
+        assert!(err.to_string().contains("fuse_session_new"), "{err}");
+
+        // An errno the call itself set is worth passing on
+        let err = libfuse_call(
+            "fuse_session_mount",
+            || nix::errno::Errno::EPERM.set(),
+            |_| false,
+        )
+        .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EPERM));
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+
+        // A call that succeeded is passed through untouched
+        assert_eq!(
+            libfuse_call("fuse_session_fd", || 3, |fd| *fd >= 0).unwrap(),
+            3
+        );
+    }
+
+    /// libfuse rejects this option in fuse_session_new(), which reports the failure without
+    /// setting errno. Reporting whatever errno was left over then surfaced as the
+    /// nonsensical "Success (os error 0)"
+    #[test]
+    #[cfg(fuser_mount_impl = "libfuse3")]
+    fn mount_option_rejected_by_libfuse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let options = [MountOption::CUSTOM("max_read=not_a_number".to_owned())];
+        let err = Mount::new(tmp.path(), &options, SessionACL::default()).unwrap_err();
+        assert_eq!(err.raw_os_error(), None, "{err}");
+        assert!(err.to_string().contains("fuse_session_new"), "{err}");
+    }
+
+    /// libfuse splits each -o argument on commas, so a comma in a value must reach it
+    /// escaped
+    #[test]
+    fn fuse_args_escaping() {
+        with_fuse_args(
+            &[MountOption::FSName("foo,ro".into())],
+            SessionACL::Owner,
+            |args| {
+                let v: Vec<_> = (0..args.argc)
+                    .map(|n| unsafe {
+                        CStr::from_ptr(*args.argv.offset(n as isize))
+                            .to_str()
+                            .unwrap()
+                    })
+                    .collect();
+                assert_eq!(*v, ["rust-fuse", "-o", "fsname=foo\\,ro"]);
+            },
+        );
+    }
+
+    /// A comma in `FSName` must end up in the source name of the mount, rather than
+    /// being interpreted as a separate mount option
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn mount_unmount_fsname_with_comma() {
+        use std::mem::ManuallyDrop;
+
+        let tmp = ManuallyDrop::new(tempfile::tempdir().unwrap());
+        let options = [MountOption::FSName("fuser,ro".to_owned())];
+        let (_file, mount) = Mount::new(tmp.path(), &options, SessionACL::default()).unwrap();
+
+        let mounts = std::fs::read_to_string("/proc/self/mounts").unwrap();
+        let fields: Vec<&str> = mounts
+            .lines()
+            .map(|line| line.split(' ').collect::<Vec<_>>())
+            .find(|fields| fields[1] == tmp.path().to_str().unwrap())
+            .unwrap_or_else(|| panic!("{:?} not found in:\n{}", tmp.path(), mounts));
+        assert_eq!(fields[0], "fuser,ro");
+        assert!(
+            !fields[3].split(',').any(|option| option == "ro"),
+            "the comma in the source name leaked into the mount options: {}",
+            fields[3]
+        );
+
+        mount.umount().unwrap();
+        ManuallyDrop::into_inner(tmp);
+    }
+
+    /// A NUL in an option value must be reported as an error, rather than panicking
+    #[test]
+    fn mount_option_with_nul() {
+        let tmp = tempfile::tempdir().unwrap();
+        let options = [MountOption::FSName("no\0name".to_owned())];
+        let err = Mount::new(tmp.path(), &options, SessionACL::default()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
     #[cfg(not(target_os = "macos"))]
     fn cmd_mount() -> String {
         std::str::from_utf8(
@@ -265,6 +547,131 @@ mod test {
         )
         .unwrap()
         .to_owned()
+    }
+
+    /// After the filesystem is unmounted by an external process (e.g. a user
+    /// running 'umount'), `is_mounted()` must report false so that session
+    /// teardown does not attempt a second unmount of the mountpoint.
+    ///
+    /// The `mount_unmount` name prefix keeps this test covered by the
+    /// `--skip=mnt::test::mount_unmount` filter used on platforms where
+    /// unprivileged mounting is unavailable.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn mount_unmount_external() {
+        use std::mem::ManuallyDrop;
+
+        // We use ManuallyDrop here to leak the directory on test failure.  We don't
+        // want to try and clean up the directory if it's a mountpoint otherwise we'll
+        // deadlock.
+        let tmp = ManuallyDrop::new(tempfile::tempdir().unwrap());
+        let (file, mount) = Mount::new(tmp.path(), &[], SessionACL::default()).unwrap();
+        assert!(is_mounted(&file));
+
+        external_unmount(tmp.path());
+        wait_until_not_mounted(&file);
+
+        // Unmounting again must succeed as a no-op now that the filesystem is
+        // already gone, on every mount backend (issue #658: the libfuse backends
+        // used to fail with EINVAL here and log a spurious warning)
+        mount
+            .umount()
+            .expect("unmount after external unmount must succeed");
+        ManuallyDrop::into_inner(tmp);
+    }
+
+    /// With `auto_unmount` the unmount used to be left to the fusermount helper, which
+    /// only acts once the mounting process exits. Until then the mountpoint was left
+    /// behind as a dangling "transport endpoint is not connected" (issue #407), so
+    /// teardown must unmount right away, like every other mount backend does.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn mount_unmount_auto_unmount() {
+        use std::mem::ManuallyDrop;
+
+        let tmp = ManuallyDrop::new(tempfile::tempdir().unwrap());
+        // The mount table lists the canonical path
+        let mountpoint = tmp.path().canonicalize().unwrap();
+        let options = [MountOption::AutoUnmount];
+        let (file, mount) = Mount::new(&mountpoint, &options, SessionACL::default()).unwrap();
+        assert!(is_mounted(&file));
+
+        mount.umount().expect("unmount must succeed");
+        let mnt = cmd_mount();
+        assert!(
+            !mnt.contains(&*mountpoint.to_string_lossy()),
+            "auto_unmount must not defer the unmount to process exit. Our mountpoint: \
+             {mountpoint:?}\nfuse mounts:\n{mnt}"
+        );
+        ManuallyDrop::into_inner(tmp);
+    }
+
+    /// After an external unmount, an unrelated replacement filesystem mounted at the
+    /// same path must not be unmounted by the old session's teardown, nor may teardown
+    /// probe the mountpoint through the (unserved) replacement filesystem, which would
+    /// block indefinitely.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn mount_unmount_replacement() {
+        use std::mem::ManuallyDrop;
+
+        let tmp = ManuallyDrop::new(tempfile::tempdir().unwrap());
+        let (file_a, mount_a) = Mount::new(tmp.path(), &[], SessionACL::default()).unwrap();
+        assert!(is_mounted(&file_a));
+
+        external_unmount(tmp.path());
+        wait_until_not_mounted(&file_a);
+
+        // Mount an unrelated replacement filesystem at the same path. Nothing serves
+        // it, so any teardown path that touches the mountpoint via the filesystem
+        // would block
+        let (file_b, mount_b) = Mount::new(tmp.path(), &[], SessionACL::default()).unwrap();
+        assert!(is_mounted(&file_b));
+
+        mount_a
+            .umount()
+            .expect("unmount after external unmount must succeed");
+        assert!(
+            is_mounted(&file_b),
+            "teardown of the old session must not unmount the replacement filesystem"
+        );
+
+        mount_b.umount().expect("replacement unmount must succeed");
+        ManuallyDrop::into_inner(tmp);
+    }
+
+    /// Unmount externally, without going through `Mount`
+    #[cfg(not(target_os = "macos"))]
+    fn external_unmount(mountpoint: &std::path::Path) {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let unmounted = ["fusermount3", "fusermount"].iter().any(|bin| {
+            std::process::Command::new(bin)
+                .arg("-u")
+                .arg(mountpoint)
+                .status()
+                .is_ok_and(|status| status.success())
+        });
+        if !unmounted {
+            // No fusermount binary available; fall back to umount(2), which
+            // requires root
+            let mountpoint = CString::new(mountpoint.as_os_str().as_bytes()).unwrap();
+            libc_umount(&mountpoint).unwrap();
+        }
+    }
+
+    /// The kernel may tear the connection down asynchronously, so allow some time
+    #[cfg(not(target_os = "macos"))]
+    fn wait_until_not_mounted(file: &Arc<DevFuse>) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while is_mounted(file) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !is_mounted(file),
+            "connection must be dead after the filesystem was unmounted"
+        );
     }
 
     #[test]
