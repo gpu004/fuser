@@ -291,7 +291,7 @@ impl From<Generation> for u64 {
 }
 
 #[cfg(test)]
-mod test {
+pub(crate) mod test {
     use std::io::IoSlice;
     use std::ops::Deref;
     use std::ops::DerefMut;

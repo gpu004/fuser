@@ -81,7 +81,7 @@ pub enum MountOption {
 
 impl MountOption {
     #[cfg(test)]
-    fn from_str(s: &str) -> MountOption {
+    pub(crate) fn from_str(s: &str) -> MountOption {
         match s {
             "auto_unmount" => MountOption::AutoUnmount,
             "default_permissions" => MountOption::DefaultPermissions,

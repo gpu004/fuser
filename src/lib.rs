@@ -92,6 +92,8 @@ mod dev_fuse;
 #[cfg(feature = "experimental")]
 pub mod experimental;
 mod forget_one;
+#[cfg(test)]
+mod hegel_tests;
 mod ll;
 mod mnt;
 mod notify;
