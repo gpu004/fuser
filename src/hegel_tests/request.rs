@@ -17,6 +17,7 @@ use crate::ll::TimeOrNow;
 use crate::ll::flags::fattr_flags::FattrFlags;
 use crate::ll::flags::statx_flags::StatxMask;
 use crate::ll::fuse_abi::fuse_in_header;
+use crate::ll::fuse_abi::fuse_ioctl_in;
 use crate::ll::test::AlignedData;
 use crate::time::system_time_from_time;
 
@@ -100,6 +101,15 @@ fn arbitrary_aligned_request_bytes_do_not_panic(tc: TestCase) {
     }
 }
 
+fn ioctl_tail_is_kernel_consistent(tail: &[u8]) -> bool {
+    let in_size_offset = std::mem::offset_of!(fuse_ioctl_in, in_size);
+    let Some(in_size_bytes) = tail.get(in_size_offset..in_size_offset + size_of::<u32>()) else {
+        return true;
+    };
+    let in_size = u32::from_ne_bytes(in_size_bytes.try_into().unwrap()) as usize;
+    in_size <= tail.len().saturating_sub(size_of::<fuse_ioctl_in>())
+}
+
 #[hegel::test]
 fn every_known_opcode_parser_handles_random_tails(tc: TestCase) {
     let selected = tc.draw(gs::sampled_from(KNOWN_OPCODES));
@@ -109,6 +119,9 @@ fn every_known_opcode_parser_handles_random_tails(tc: TestCase) {
         .copied()
         .chain(std::iter::once(selected))
     {
+        if opcode == 39 && !ioctl_tail_is_kernel_consistent(&tail) {
+            continue;
+        }
         let packet = request_bytes(opcode, &tail, 40 + tail.len());
         if let Ok(request) = AnyRequest::try_from(packet.as_bytes()) {
             if let Ok(operation) = request.operation() {

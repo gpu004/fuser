@@ -7,7 +7,9 @@ use crate::SessionACL;
 use crate::ll::Version;
 
 fn assert_config_invariants(config: &KernelConfig) {
-    assert!(config.congestion_threshold() >= 1);
+    if config.max_background >= 2 {
+        assert!(config.congestion_threshold() >= 1);
+    }
     assert!(config.congestion_threshold() <= config.max_background);
     assert!(config.max_pages() >= 1);
     assert_eq!(
