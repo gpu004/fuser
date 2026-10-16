@@ -6,6 +6,7 @@ use hegel::TestCase;
 use hegel::generators as gs;
 use zerocopy::IntoBytes;
 
+#[cfg(not(target_os = "macos"))]
 use crate::InitFlags;
 use crate::LockOwner;
 use crate::ll::AnyRequest;
@@ -607,7 +608,7 @@ fn setattr_and_directory_request_fields_roundtrip(tc: TestCase) {
     push_u32(&mut args, gid);
     push_u32(&mut args, 0);
     #[cfg(target_os = "macos")]
-    args.resize(size_of::<abi::fuse_setattr_in>(), 0);
+    args.resize(size_of::<crate::ll::fuse_abi::fuse_setattr_in>(), 0);
     let packet = typed_request(4, nodeid, &args);
     let (_, operation) = parse(&packet);
     let Operation::SetAttr(parsed) = operation else {
